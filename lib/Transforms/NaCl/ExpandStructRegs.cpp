@@ -143,8 +143,9 @@ static void ProcessLoadOrStoreAttrs(InstType *Dest, InstType *Src) {
   Dest->setAlignment(1);
 }
 
+template <typename StructOrArrayType>
 static void SplitUpStore(StoreInst *Store) {
-  StructType *STy = cast<StructType>(Store->getValueOperand()->getType());
+  StructOrArrayType *STy = cast<StructOrArrayType>(Store->getValueOperand()->getType());
   // Create a separate store instruction for each struct field.
   for (unsigned Index = 0; Index < STy->getNumElements(); ++Index) {
     SmallVector<Value *, 2> Indexes;
@@ -160,12 +161,19 @@ static void SplitUpStore(StoreInst *Store) {
                                             EVIndexes, "", Store);
     StoreInst *NewStore = new StoreInst(Field, GEP, Store);
     ProcessLoadOrStoreAttrs(NewStore, Store);
+
+    if (NewStore->getValueOperand()->getType()->isStructTy()) {
+      SplitUpStore<StructType>(NewStore);
+    } else if (NewStore->getValueOperand()->getType()->isArrayTy()) {
+      SplitUpStore<ArrayType>(NewStore);
+    }
   }
   Store->eraseFromParent();
 }
 
+template <typename StructOrArrayType>
 static void SplitUpLoad(LoadInst *Load) {
-  StructType *STy = cast<StructType>(Load->getType());
+  StructOrArrayType *STy = cast<StructOrArrayType>(Load->getType());
   Value *NewStruct = UndefValue::get(STy);
 
   // Create a separate load instruction for each struct field.
@@ -185,38 +193,109 @@ static void SplitUpLoad(LoadInst *Load) {
     NewStruct = CopyDebug(
         InsertValueInst::Create(NewStruct, NewLoad, EVIndexes,
                                 Load->getName() + ".insert", Load), Load);
+
+    if (NewLoad->getType()->isStructTy()) {
+      SplitUpLoad<StructType>(NewLoad);
+    } else if (NewLoad->getType()->isArrayTy()) {
+      SplitUpLoad<ArrayType>(NewLoad);
+    }
   }
   Load->replaceAllUsesWith(NewStruct);
   Load->eraseFromParent();
 }
 
-static void ExpandExtractValue(ExtractValueInst *EV) {
+static Value *GetExtractedValue(ExtractValueInst *EV);
+
+template <typename StructOrArrayType>
+static Value *GetExtractedCompoundValue(ExtractValueInst *EV) {
+  StructOrArrayType *STy = cast<StructOrArrayType>(EV->getType());
+  Value *NewStruct = UndefValue::get(STy);
+
+  SmallVector<unsigned, 4> Indexes;
+  for (unsigned I = 0; I < EV->getNumIndices(); ++I) {
+    Indexes.push_back(EV->getIndices()[I]);
+  }
+  Indexes.push_back(0);
+
+  for (unsigned I = 0; I < STy->getNumElements(); ++I) {
+    Indexes.back() = I;
+    // Skip copying debug info, since NewEV is never actually added to the
+    // basic block.
+    ExtractValueInst *NewEV = 
+        ExtractValueInst::Create(EV->getAggregateOperand(), Indexes,
+                                 EV->getName() + ".extract", EV);
+    Value *ExtractedValue = GetExtractedValue(NewEV);
+    NewEV->eraseFromParent();
+
+    SmallVector<unsigned, 1> IVIndexes;
+    IVIndexes.push_back(I);
+    NewStruct = CopyDebug(
+        InsertValueInst::Create(NewStruct, ExtractedValue, IVIndexes,
+                                EV->getName() + ".insert", EV), EV);
+  }
+
+  return NewStruct;
+}
+
+static Value *GetExtractedValue(ExtractValueInst *EV) {
+  if (EV->getType()->isStructTy()) {
+    return GetExtractedCompoundValue<StructType>(EV);
+  } else if (EV->getType()->isArrayTy()) {
+    return GetExtractedCompoundValue<ArrayType>(EV);
+  }
+
   // Search for the insertvalue instruction that inserts the struct
   // field referenced by this extractvalue instruction.
-  Value *StructVal = EV->getAggregateOperand();
-  Value *ResultField;
-  for (;;) {
-    if (InsertValueInst *IV = dyn_cast<InsertValueInst>(StructVal)) {
-      if (EV->getNumIndices() != 1 || IV->getNumIndices() != 1) {
-        errs() << "Value: " << *EV << "\n";
-        errs() << "Value: " << *IV << "\n";
-        report_fatal_error("ExpandStructRegs does not handle nested structs");
+  Value *CurrentVal = EV->getAggregateOperand();
+  unsigned I = 0;
+  while (I < EV->getNumIndices()) {
+    if (InsertValueInst *IV = dyn_cast<InsertValueInst>(CurrentVal)) {
+      bool AllMatch = true;
+      for (unsigned J = 0; J < IV->getNumIndices(); ++J) {
+        if (I + J >= EV->getNumIndices()) {
+          // We're matching `extractvalue %foo, 0, 1` (I = 0) against
+          // `%foo = insertvalue %bar, %baz, 0, 1, 2`.
+          // That means we're extracting a struct/array value that was built
+          // using multiple `insertvalue` instructions.
+          errs() << "Extract: " << *EV << "\n";
+          errs() << "Indices handled so far: " << I << "\n";
+          errs() << "Insert: " << *IV << "\n";
+          report_fatal_error("ExpandStructRegs does not handle extracting "
+                  "values built with multiple insertvalue instructions");
+        }
+
+        if (EV->getIndices()[I + J] != IV->getIndices()[J]) {
+          AllMatch = false;
+          break;
+        }
       }
-      if (EV->getIndices()[0] == IV->getIndices()[0]) {
-        ResultField = IV->getInsertedValueOperand();
-        break;
+
+      if (AllMatch) {
+        // We handled some of the `extractvalue` indices, but possibly not all
+        // of them.
+        CurrentVal = IV->getInsertedValueOperand();
+        I += IV->getNumIndices();
+        continue;
+      } else {
+        // No match.  Try the next struct value in the chain.
+        CurrentVal = IV->getAggregateOperand();
       }
-      // No match.  Try the next struct value in the chain.
-      StructVal = IV->getAggregateOperand();
-    } else if (Constant *C = dyn_cast<Constant>(StructVal)) {
-      ResultField = ConstantExpr::getExtractValue(C, EV->getIndices());
+    } else if (Constant *C = dyn_cast<Constant>(CurrentVal)) {
+      // C is the value of `extractvalue %foo, idx0, ..., idx(I-1)`.  Use the
+      // remaining indices to get the final result.
+      CurrentVal = ConstantExpr::getExtractValue(C, EV->getIndices().slice(I));
       break;
     } else {
-      errs() << "Value: " << *StructVal << "\n";
+      errs() << "Value: " << *CurrentVal << "\n";
       report_fatal_error("Unrecognized struct value");
     }
   }
-  EV->replaceAllUsesWith(ResultField);
+
+  return CurrentVal;
+}
+
+static void ExpandExtractValue(ExtractValueInst *EV) {
+  EV->replaceAllUsesWith(GetExtractedValue(EV));
   EV->eraseFromParent();
 }
 
@@ -233,12 +312,18 @@ bool ExpandStructRegs::runOnFunction(Function &Func) {
       Instruction *Inst = Iter++;
       if (StoreInst *Store = dyn_cast<StoreInst>(Inst)) {
         if (Store->getValueOperand()->getType()->isStructTy()) {
-          SplitUpStore(Store);
+          SplitUpStore<StructType>(Store);
+          Changed = true;
+        } else if (Store->getValueOperand()->getType()->isArrayTy()) {
+          SplitUpStore<ArrayType>(Store);
           Changed = true;
         }
       } else if (LoadInst *Load = dyn_cast<LoadInst>(Inst)) {
         if (Load->getType()->isStructTy()) {
-          SplitUpLoad(Load);
+          SplitUpLoad<StructType>(Load);
+          Changed = true;
+        } else if (Load->getType()->isArrayTy()) {
+          SplitUpLoad<ArrayType>(Load);
           Changed = true;
         }
       } else if (PHINode *Phi = dyn_cast<PHINode>(Inst)) {
@@ -255,10 +340,7 @@ bool ExpandStructRegs::runOnFunction(Function &Func) {
     }
   }
 
-  // Expand out all the extractvalue instructions.  Also collect up
-  // the insertvalue instructions for later deletion so that we do not
-  // need to make extra passes across the whole function.
-  SmallVector<Instruction *, 10> ToErase;
+  // Expand out all the extractvalue instructions.
   for (Function::iterator BB = Func.begin(), E = Func.end();
        BB != E; ++BB) {
     for (BasicBlock::iterator Iter = BB->begin(), E = BB->end();
@@ -267,12 +349,26 @@ bool ExpandStructRegs::runOnFunction(Function &Func) {
       if (ExtractValueInst *EV = dyn_cast<ExtractValueInst>(Inst)) {
         ExpandExtractValue(EV);
         Changed = true;
-      } else if (isa<InsertValueInst>(Inst)) {
+      }
+    }
+  }
+
+  // Now collect up all the insertvalue instructions for deletion.  This must
+  // happen after expanding all extractvalues in order to catch insertvalues
+  // introduced by GetExtractedCompoundValue.
+  SmallVector<Instruction *, 10> ToErase;
+  for (Function::iterator BB = Func.begin(), E = Func.end();
+       BB != E; ++BB) {
+    for (BasicBlock::iterator Iter = BB->begin(), E = BB->end();
+         Iter != E; ) {
+      Instruction *Inst = Iter++;
+      if (isa<InsertValueInst>(Inst)) {
         ToErase.push_back(Inst);
         Changed = true;
       }
     }
   }
+
   // Delete the insertvalue instructions.  These can reference each
   // other, so we must do dropAllReferences() before doing
   // eraseFromParent(), otherwise we will try to erase instructions
